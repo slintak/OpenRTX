@@ -45,6 +45,20 @@ path = [
 SPDX-License-Identifier = "GPL-3.0-or-later"
 SPDX-FileCopyrightText = "OpenRTX Contributors"
 
+# rtxlink v2 proposal files without a comment syntax; the Python sources
+# carry their own SPDX headers
+[[annotations]]
+path = [
+    "proposals/rtxlink-v2/README.md",
+    "proposals/rtxlink-v2/rtxlink-v2.md",
+    "proposals/rtxlink-v2/simulator/README.md",
+    "proposals/rtxlink-v2/simulator/pyproject.toml",
+    "proposals/rtxlink-v2/simulator/uv.lock",
+    "proposals/rtxlink-v2/simulator/.gitignore",
+]
+SPDX-License-Identifier = "GPL-3.0-or-later"
+SPDX-FileCopyrightText = "OpenRTX Contributors"
+
 # This section is for font glyph sources that were taken from Pictogrammers
 [[annotations]]
 path = [

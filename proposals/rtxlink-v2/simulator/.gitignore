@@ -1,0 +1,4 @@
+.venv/
+radio-fs/
+__pycache__/
+*.egg-info/
