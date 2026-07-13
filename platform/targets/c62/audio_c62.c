@@ -13,17 +13,23 @@
 #include "AudioTrack.h"
 #include "AudioRecord.h"
 #include <assert.h>
+#include <errno.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <interfaces/audio.h>
+#include <interfaces/radio.h>
 
-#define SAMPLE_RATE (16000) // Sample rate in Hz
+#define BRIDGE_SAMPLE_RATE (16000) // Sample rate for direct analogue paths
+
+#define C62_M17_INPUT_RATE (24000U)
+#define C62_ADC_NATIVE_RATE (48000U)
+#define C62_RATE_REPORT_MS (2000U)
 
 // Live audio streaming configuration
 #define AUDIO_CHUNK_MS (20) // 20ms chunks for low latency
-#define AUDIO_CHUNK_SAMPLES (SAMPLE_RATE * AUDIO_CHUNK_MS / 1000)
+#define AUDIO_CHUNK_SAMPLES (BRIDGE_SAMPLE_RATE * AUDIO_CHUNK_MS / 1000)
 #define AUDIO_CHUNK_SIZE (AUDIO_CHUNK_SAMPLES * sizeof(int16_t))
 #define AUDIO_BUFFER_CHUNKS (8) // Circular buffer with multiple chunks
 #define AUDIO_THREAD_STACK_SIZE (8 * 1024)
@@ -74,6 +80,7 @@ static AudioTrack s_track_rtx_output;
 
 static bool s_audio_initialized = false;
 static bool s_audio_streaming = false;
+static bool s_bridge_initialized = false;
 
 // Track which devices are currently active
 static bool s_mic_active = false;
@@ -81,16 +88,23 @@ static bool s_rtx_input_active = false;
 static bool s_spk_active = false;
 static bool s_rtx_output_active = false;
 
+static const struct audioDriver c62_input_audio_driver;
+static const struct audioDriver c62_output_audio_driver;
+
 const struct audioDevice outputDevices[] = {
     { NULL, 0, 0, SINK_MCU },
-    { NULL, 0, 0, SINK_RTX },
-    { NULL, 0, 0, SINK_SPK },
+    { &c62_output_audio_driver, (const void *)(uintptr_t)C62_AUDIO_CHANNEL_TX,
+      0, SINK_RTX },
+    { &c62_output_audio_driver, (const void *)(uintptr_t)C62_AUDIO_CHANNEL_SPK,
+      1, SINK_SPK },
 };
 
 const struct audioDevice inputDevices[] = {
-    { NULL, 0, 0, SINK_MCU },
-    { NULL, 0, 0, SINK_RTX },
-    { NULL, 0, 0, SINK_SPK },
+    { NULL, 0, 0, SOURCE_MCU },
+    { &c62_input_audio_driver, (const void *)(uintptr_t)C62_AUDIO_CHANNEL_RX, 0,
+      SOURCE_RTX },
+    { &c62_input_audio_driver, (const void *)(uintptr_t)C62_AUDIO_CHANNEL_MIC,
+      1, SOURCE_MIC },
 };
 
 // Ring buffer for audio data exchange (in PSRAM)
@@ -102,24 +116,418 @@ static struct k_thread s_audio_output_thread;
 K_THREAD_STACK_DEFINE(s_audio_input_stack, AUDIO_THREAD_STACK_SIZE);
 K_THREAD_STACK_DEFINE(s_audio_output_stack, AUDIO_THREAD_STACK_SIZE);
 
-#define FREQUENCY 440 // Frequency of the sine wave in Hz (A4)
+/*
+ * The C62 DSP can capture the ADC natively at 48 kHz, but OpenRTX currently
+ * configures its M17 demodulator for 24 kHz.  Capture at 48 kHz and apply a
+ * real low-pass decimator to satisfy that existing interface.  M17 can also
+ * operate directly at 48 kHz; once the complete firmware path uses that rate,
+ * this conversion is no longer needed.
+ *
+ * Opening a 48 kHz record stream requires the C62 DSP patch.  The stock DSP
+ * firmware rejects every input rate except 16 kHz.
+ *
+ * 31-tap, unity-gain Blackman-windowed low-pass, Fc = 8 kHz at Fs = 48 kHz.
+ * The coefficients are Q15.  Response is approximately -0.1 dB at 4.8 kHz
+ * and -63 dB at the new 12 kHz Nyquist frequency.
+ */
+#define C62_DECIM_TAPS 31
+static const int16_t c62_decim_coeffs[C62_DECIM_TAPS] = {
+    0,     3,   12,   0,    -63,   -117, 0,    327, 509,   0,     -1138,
+    -1685, 0,   4203, 8874, 10918, 8874, 4203, 0,   -1685, -1138, 0,
+    509,   327, 0,    -117, -63,   0,    12,   3,   0,
+};
 
-/* Fill buffer with sine wave data */
-static void fillSineWave(uint8_t *buffer, size_t size)
+typedef struct {
+    AudioRecord record;
+    struct streamCtx *ctx;
+    stream_sample_t *raw_buffer;
+    stream_sample_t *ready_buffer;
+    size_t block_samples;
+    size_t raw_samples;
+    uint32_t physical_rate;
+    uint8_t next_half;
+    uint8_t instance;
+    bool opened;
+    bool decimate_by_two;
+    int16_t fir_delay[C62_DECIM_TAPS];
+    size_t fir_pos;
+    uint8_t fir_phase;
+    uint64_t sample_count;
+    int64_t rate_start_ms;
+    int64_t rate_report_ms;
+} C62InputStream;
+
+typedef struct {
+    AudioTrack track;
+    struct streamCtx *ctx;
+    size_t block_samples;
+    uint8_t next_half;
+    uint8_t instance;
+    bool opened;
+    bool stop_requested;
+    uint64_t sample_count;
+    int64_t rate_start_ms;
+    int64_t rate_report_ms;
+} C62OutputStream;
+
+static C62InputStream s_input_streams[2];
+static C62OutputStream s_output_streams[2];
+
+static int16_t q15_saturate(int64_t value)
 {
-    // Calculate the sine wave
-    for (size_t i = 0; i < size / sizeof(int16_t); i++) {
-        // Calculate sample value
-        double sample = sin(2.0 * M_PI * FREQUENCY * (i / (double)SAMPLE_RATE));
+    value += 1LL << 14;
+    value >>= 15;
 
-        // Scale to 16-bit PCM range (-32768 to 32767)
-        int16_t pcmValue = (int16_t)(sample * 32767);
+    if (value > INT16_MAX)
+        return INT16_MAX;
+    if (value < INT16_MIN)
+        return INT16_MIN;
+    return (int16_t)value;
+}
 
-        // Store the PCM value in the buffer
-        buffer[2 * i] = (uint8_t)(pcmValue & 0xFF);            // LSB
-        buffer[2 * i + 1] = (uint8_t)((pcmValue >> 8) & 0xFF); // MSB
+static void decimate_48k_to_24k(C62InputStream *stream,
+                                const stream_sample_t *input,
+                                size_t input_samples, stream_sample_t *output)
+{
+    size_t out_pos = 0;
+
+    for (size_t i = 0; i < input_samples; i++) {
+        stream->fir_delay[stream->fir_pos] = input[i];
+        stream->fir_pos = (stream->fir_pos + 1) % C62_DECIM_TAPS;
+        stream->fir_phase ^= 1;
+
+        if (stream->fir_phase != 0)
+            continue;
+
+        int64_t accumulator = 0;
+        size_t pos = stream->fir_pos;
+        for (size_t tap = 0; tap < C62_DECIM_TAPS; tap++) {
+            pos = (pos == 0) ? C62_DECIM_TAPS - 1 : pos - 1;
+            accumulator += (int32_t)stream->fir_delay[pos]
+                         * c62_decim_coeffs[tap];
+        }
+        output[out_pos++] = q15_saturate(accumulator);
+    }
+
+    __ASSERT(out_pos == input_samples / 2, "invalid C62 decimator phase");
+}
+
+static void report_input_rate(C62InputStream *stream)
+{
+    int64_t now = k_uptime_get();
+    if ((now - stream->rate_report_ms) < C62_RATE_REPORT_MS)
+        return;
+
+    int64_t elapsed = now - stream->rate_start_ms;
+    uint32_t measured = 0;
+    if (elapsed > 0)
+        measured = (uint32_t)((stream->sample_count * 1000U) / elapsed);
+
+    printk("C62RATE input=%u logical=%u physical=%u samples=%u ms=%u "
+           "measured=%u\n",
+           stream->instance, stream->ctx->sampleRate, stream->physical_rate,
+           (uint32_t)stream->sample_count, (uint32_t)elapsed, measured);
+    stream->rate_report_ms = now;
+}
+
+static void report_output_rate(C62OutputStream *stream)
+{
+    int64_t now = k_uptime_get();
+    if ((now - stream->rate_report_ms) < C62_RATE_REPORT_MS)
+        return;
+
+    int64_t elapsed = now - stream->rate_start_ms;
+    uint32_t measured = 0;
+    if (elapsed > 0)
+        measured = (uint32_t)((stream->sample_count * 1000U) / elapsed);
+
+    printk("C62RATE output=%u rate=%u samples=%u ms=%u submitted=%u\n",
+           stream->instance, stream->ctx->sampleRate,
+           (uint32_t)stream->sample_count, (uint32_t)elapsed, measured);
+    stream->rate_report_ms = now;
+}
+
+static void c62_input_close(C62InputStream *stream)
+{
+    struct streamCtx *ctx = stream->ctx;
+
+    if (stream->opened)
+        AudioRecord_dtor(&stream->record);
+    if (stream->raw_buffer != NULL)
+        k_free(stream->raw_buffer);
+
+    memset(stream, 0, sizeof(*stream));
+    if (ctx != NULL) {
+        ctx->priv = NULL;
+        ctx->running = 0;
     }
 }
+
+static int c62_input_start(const uint8_t instance, const void *config,
+                           struct streamCtx *ctx)
+{
+    if ((ctx == NULL) || (instance >= ARRAY_SIZE(s_input_streams)))
+        return -EINVAL;
+    if ((ctx->running != 0) || (ctx->bufSize == 0))
+        return -EBUSY;
+    if ((ctx->bufMode == BUF_CIRC_DOUBLE) && ((ctx->bufSize & 1U) != 0))
+        return -EINVAL;
+
+    C62InputStream *stream = &s_input_streams[instance];
+    if (stream->ctx != NULL)
+        return -EBUSY;
+
+    memset(stream, 0, sizeof(*stream));
+    stream->ctx = ctx;
+    stream->instance = instance;
+    stream->block_samples = (ctx->bufMode == BUF_CIRC_DOUBLE) ?
+                                ctx->bufSize / 2 :
+                                ctx->bufSize;
+    stream->decimate_by_two = (ctx->sampleRate == C62_M17_INPUT_RATE);
+    stream->physical_rate = stream->decimate_by_two ? C62_ADC_NATIVE_RATE :
+                                                      ctx->sampleRate;
+    stream->raw_samples = stream->decimate_by_two ? stream->block_samples * 2 :
+                                                    stream->block_samples;
+
+    if (stream->decimate_by_two) {
+        stream->raw_buffer =
+            k_malloc(stream->raw_samples * sizeof(stream_sample_t));
+        if (stream->raw_buffer == NULL) {
+            c62_input_close(stream);
+            return -ENOMEM;
+        }
+    }
+
+    uint32_t channel = (uint32_t)(uintptr_t)config;
+    int ret = AudioRecord_ctor(&stream->record, 0, stream->physical_rate,
+                               PCM_16_BIT, channel, 0, NULL);
+    if (ret != 0) {
+        printk("C62AUDIO input open failed: endpoint=%u logical=%u physical=%u "
+               "error=%d\n",
+               instance, ctx->sampleRate, stream->physical_rate, ret);
+        c62_input_close(stream);
+        return ret;
+    }
+    stream->opened = true;
+
+    size_t af_frame_samples = stream->record.mCblk->frameCount;
+    if ((af_frame_samples == 0)
+        || ((stream->raw_samples % af_frame_samples) != 0)) {
+        printk("C62AUDIO incompatible input block: requested=%u DSP=%u\n",
+               (uint32_t)stream->raw_samples, (uint32_t)af_frame_samples);
+        c62_input_close(stream);
+        return -EINVAL;
+    }
+
+    AudioRecord_start(&stream->record);
+    ctx->priv = stream;
+    ctx->running = 1;
+    stream->rate_start_ms = k_uptime_get();
+    stream->rate_report_ms = stream->rate_start_ms;
+
+    printk("C62AUDIO input start: endpoint=%u logical=%u physical=%u block=%u "
+           "DSPframe=%u conversion=%s\n",
+           instance, ctx->sampleRate, stream->physical_rate,
+           (uint32_t)stream->block_samples, (uint32_t)af_frame_samples,
+           stream->decimate_by_two ? "FIR/2" : "none");
+    return 0;
+}
+
+static int c62_input_data(struct streamCtx *ctx, stream_sample_t **buffer)
+{
+    if ((ctx == NULL) || (buffer == NULL) || (ctx->priv == NULL))
+        return -EINVAL;
+
+    C62InputStream *stream = ctx->priv;
+    if (stream->ready_buffer == NULL)
+        return -EAGAIN;
+
+    *buffer = stream->ready_buffer;
+    return (int)stream->block_samples;
+}
+
+static int c62_input_sync(struct streamCtx *ctx, uint8_t dirty)
+{
+    (void)dirty;
+    if ((ctx == NULL) || (ctx->priv == NULL) || (ctx->running == 0))
+        return -EPIPE;
+
+    C62InputStream *stream = ctx->priv;
+    stream_sample_t *destination = ctx->buffer;
+    if (ctx->bufMode == BUF_CIRC_DOUBLE)
+        destination += stream->next_half * stream->block_samples;
+
+    void *read_buffer = stream->decimate_by_two ? (void *)stream->raw_buffer :
+                                                  (void *)destination;
+    size_t read_bytes = stream->raw_samples * sizeof(stream_sample_t);
+    ssize_t ret = AudioRecord_read(&stream->record, read_buffer, read_bytes);
+    if (ret < 0)
+        return (int)ret;
+    if ((size_t)ret != read_bytes) {
+        printk("C62AUDIO short input read: expected=%u actual=%d\n",
+               (uint32_t)read_bytes, (int)ret);
+        return -EIO;
+    }
+
+    if (stream->decimate_by_two)
+        decimate_48k_to_24k(stream, stream->raw_buffer, stream->raw_samples,
+                            destination);
+
+    stream->ready_buffer = destination;
+    if (ctx->bufMode == BUF_CIRC_DOUBLE)
+        stream->next_half ^= 1;
+    stream->sample_count += stream->block_samples;
+    report_input_rate(stream);
+    return 0;
+}
+
+static void c62_input_stop(struct streamCtx *ctx)
+{
+    if ((ctx == NULL) || (ctx->priv == NULL))
+        return;
+    c62_input_close(ctx->priv);
+}
+
+static void c62_input_terminate(struct streamCtx *ctx)
+{
+    c62_input_stop(ctx);
+}
+
+static void c62_output_close(C62OutputStream *stream)
+{
+    struct streamCtx *ctx = stream->ctx;
+
+    if (stream->opened)
+        AudioTrack_dtor(&stream->track);
+
+    memset(stream, 0, sizeof(*stream));
+    if (ctx != NULL) {
+        ctx->priv = NULL;
+        ctx->running = 0;
+    }
+}
+
+static int c62_output_start(const uint8_t instance, const void *config,
+                            struct streamCtx *ctx)
+{
+    if ((ctx == NULL) || (instance >= ARRAY_SIZE(s_output_streams)))
+        return -EINVAL;
+    if ((ctx->running != 0) || (ctx->bufSize == 0))
+        return -EBUSY;
+    if ((ctx->bufMode == BUF_CIRC_DOUBLE) && ((ctx->bufSize & 1U) != 0))
+        return -EINVAL;
+
+    C62OutputStream *stream = &s_output_streams[instance];
+    if (stream->ctx != NULL)
+        return -EBUSY;
+
+    memset(stream, 0, sizeof(*stream));
+    stream->ctx = ctx;
+    stream->instance = instance;
+    stream->block_samples = (ctx->bufMode == BUF_CIRC_DOUBLE) ?
+                                ctx->bufSize / 2 :
+                                ctx->bufSize;
+
+    uint32_t channel = (uint32_t)(uintptr_t)config;
+    int ret = AudioTrack_ctor(&stream->track, ctx->sampleRate, PCM_16_BIT,
+                              channel, 0, NULL);
+    if (ret != 0) {
+        printk("C62AUDIO output open failed: endpoint=%u rate=%u error=%d\n",
+               instance, ctx->sampleRate, ret);
+        c62_output_close(stream);
+        return ret;
+    }
+    stream->opened = true;
+
+    AudioTrack_start(&stream->track);
+    ctx->priv = stream;
+    ctx->running = 1;
+    stream->rate_start_ms = k_uptime_get();
+    stream->rate_report_ms = stream->rate_start_ms;
+
+    printk("C62AUDIO output start: endpoint=%u rate=%u block=%u\n", instance,
+           ctx->sampleRate, (uint32_t)stream->block_samples);
+    return 0;
+}
+
+static int c62_output_data(struct streamCtx *ctx, stream_sample_t **buffer)
+{
+    if ((ctx == NULL) || (buffer == NULL) || (ctx->priv == NULL))
+        return -EINVAL;
+
+    C62OutputStream *stream = ctx->priv;
+    *buffer = ctx->buffer;
+    if (ctx->bufMode == BUF_CIRC_DOUBLE)
+        *buffer += stream->next_half * stream->block_samples;
+    return (int)stream->block_samples;
+}
+
+static int c62_output_sync(struct streamCtx *ctx, uint8_t dirty)
+{
+    (void)dirty;
+    if ((ctx == NULL) || (ctx->priv == NULL) || (ctx->running == 0))
+        return -EPIPE;
+
+    C62OutputStream *stream = ctx->priv;
+    if (stream->stop_requested) {
+        uint32_t drain_ms =
+            (uint32_t)((stream->block_samples * 1000U) / ctx->sampleRate);
+        k_sleep(K_MSEC(drain_ms + 1));
+        c62_output_close(stream);
+        return 0;
+    }
+
+    stream_sample_t *source = ctx->buffer;
+    if (ctx->bufMode == BUF_CIRC_DOUBLE)
+        source += stream->next_half * stream->block_samples;
+
+    size_t write_bytes = stream->block_samples * sizeof(stream_sample_t);
+    ssize_t ret = AudioTrack_write(&stream->track, source, write_bytes);
+    if (ret < 0)
+        return (int)ret;
+    if ((size_t)ret != write_bytes) {
+        printk("C62AUDIO short output write: expected=%u actual=%d\n",
+               (uint32_t)write_bytes, (int)ret);
+        return -EIO;
+    }
+
+    if (ctx->bufMode == BUF_CIRC_DOUBLE)
+        stream->next_half ^= 1;
+    stream->sample_count += stream->block_samples;
+    report_output_rate(stream);
+    return 0;
+}
+
+static void c62_output_stop(struct streamCtx *ctx)
+{
+    if ((ctx == NULL) || (ctx->priv == NULL))
+        return;
+    C62OutputStream *stream = ctx->priv;
+    stream->stop_requested = true;
+}
+
+static void c62_output_terminate(struct streamCtx *ctx)
+{
+    if ((ctx == NULL) || (ctx->priv == NULL))
+        return;
+    c62_output_close(ctx->priv);
+}
+
+static const struct audioDriver c62_input_audio_driver = {
+    .start = c62_input_start,
+    .data = c62_input_data,
+    .sync = c62_input_sync,
+    .stop = c62_input_stop,
+    .terminate = c62_input_terminate,
+};
+
+static const struct audioDriver c62_output_audio_driver = {
+    .start = c62_output_start,
+    .data = c62_output_data,
+    .sync = c62_output_sync,
+    .stop = c62_output_stop,
+    .terminate = c62_output_terminate,
+};
 
 // Ring buffer helper functions
 static void ring_buffer_init(AudioRingBuffer *rb)
@@ -335,6 +743,51 @@ static void audio_output_thread(void *arg1, void *arg2, void *arg3)
     printk("Audio output thread stopped\n");
 }
 
+static int bridge_init(void)
+{
+    if (s_bridge_initialized)
+        return 0;
+
+    int ret = AudioRecord_ctor(&s_record, 0, BRIDGE_SAMPLE_RATE, PCM_16_BIT,
+                               C62_AUDIO_CHANNEL_MIC | C62_AUDIO_CHANNEL_RX, 0,
+                               NULL);
+    if (ret != 0) {
+        printk("Failed to initialize bridge AudioRecord: %d\n", ret);
+        return ret;
+    }
+
+    ret = AudioTrack_ctor(&s_track_spk, BRIDGE_SAMPLE_RATE, PCM_16_BIT,
+                          C62_AUDIO_CHANNEL_SPK, 0, NULL);
+    if (ret != 0) {
+        printk("Failed to initialize bridge speaker AudioTrack: %d\n", ret);
+        AudioRecord_dtor(&s_record);
+        return ret;
+    }
+
+    ret = AudioTrack_ctor(&s_track_rtx_output, BRIDGE_SAMPLE_RATE, PCM_16_BIT,
+                          C62_AUDIO_CHANNEL_TX, 0, NULL);
+    if (ret != 0) {
+        printk("Failed to initialize bridge RTX AudioTrack: %d\n", ret);
+        AudioRecord_dtor(&s_record);
+        AudioTrack_dtor(&s_track_spk);
+        return ret;
+    }
+
+    s_bridge_initialized = true;
+    return 0;
+}
+
+static void bridge_terminate(void)
+{
+    if (!s_bridge_initialized)
+        return;
+
+    AudioRecord_dtor(&s_record);
+    AudioTrack_dtor(&s_track_spk);
+    AudioTrack_dtor(&s_track_rtx_output);
+    s_bridge_initialized = false;
+}
+
 void audio_init()
 {
     int ret;
@@ -368,34 +821,6 @@ void audio_init()
     String8_dtor(&param);
     if (ret != 0) {
         printk("Failed to set audio parameters: %d\n", ret);
-        return;
-    }
-
-    // Initialize AudioRecord for MIC and RTX input interleaved
-    ret = AudioRecord_ctor(&s_record, 0, SAMPLE_RATE, PCM_16_BIT,
-                           C62_AUDIO_CHANNEL_MIC | C62_AUDIO_CHANNEL_RX, 0,
-                           NULL);
-    if (ret != 0) {
-        printk("Failed to initialize AudioRecord RTX_INPUT: %d\n", ret);
-        return;
-    }
-
-    // Initialize AudioTrack for speaker output
-    ret = AudioTrack_ctor(&s_track_spk, SAMPLE_RATE, PCM_16_BIT,
-                          C62_AUDIO_CHANNEL_SPK, 0, NULL);
-    if (ret != 0) {
-        printk("Failed to initialize AudioTrack SPK: %d\n", ret);
-        AudioRecord_dtor(&s_record);
-        return;
-    }
-
-    // Initialize AudioTrack for RTX output
-    ret = AudioTrack_ctor(&s_track_rtx_output, SAMPLE_RATE, PCM_16_BIT,
-                          C62_AUDIO_CHANNEL_TX, 0, NULL);
-    if (ret != 0) {
-        printk("Failed to initialize AudioTrack RTX_OUTPUT: %d\n", ret);
-        AudioRecord_dtor(&s_record);
-        AudioTrack_dtor(&s_track_spk);
         return;
     }
 
@@ -435,10 +860,16 @@ void audio_terminate()
         }
     }
 
-    // Clean up audio objects
-    AudioRecord_dtor(&s_record);
-    AudioTrack_dtor(&s_track_spk);
-    AudioTrack_dtor(&s_track_rtx_output);
+    bridge_terminate();
+
+    for (size_t i = 0; i < ARRAY_SIZE(s_input_streams); i++) {
+        if (s_input_streams[i].ctx != NULL)
+            c62_input_close(&s_input_streams[i]);
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(s_output_streams); i++) {
+        if (s_output_streams[i].ctx != NULL)
+            c62_output_close(&s_output_streams[i]);
+    }
 
     // Clear all paths
     k_mutex_lock(&s_audio_mutex, K_FOREVER);
@@ -459,9 +890,24 @@ void audio_connect(const enum AudioSource source, const enum AudioSink sink)
         audio_init();
     }
 
-    if (PATH(source, sink) == PATH(SOURCE_RTX, SINK_SPK)) {
+    if (source == SOURCE_RTX)
         radio_enableAfOutput();
+
+    if (sink == SINK_SPK)
         gpio_pin_set_dt(&speaker_enable, 1);
+
+    /*
+     * Paths touching the MCU are moved by the audioDriver callbacks above.
+     * Only direct hardware-to-hardware paths need the legacy 16 kHz bridge.
+     */
+    if ((source == SOURCE_MCU) || (sink == SINK_MCU)) {
+        printk("Audio stream path connected: %d->%d\n", source, sink);
+        return;
+    }
+
+    if (bridge_init() != 0) {
+        printk("Unable to open direct audio bridge: %d->%d\n", source, sink);
+        return;
     }
 
     k_mutex_lock(&s_audio_mutex, K_FOREVER);
@@ -538,9 +984,15 @@ void audio_disconnect(const enum AudioSource source, const enum AudioSink sink)
         return;
     }
 
-    if (PATH(source, sink) == PATH(SOURCE_RTX, SINK_SPK)) {
+    if (sink == SINK_SPK)
         gpio_pin_set_dt(&speaker_enable, 0);
+
+    if (source == SOURCE_RTX)
         radio_disableAfOutput();
+
+    if ((source == SOURCE_MCU) || (sink == SINK_MCU)) {
+        printk("Audio stream path disconnected: %d->%d\n", source, sink);
+        return;
     }
 
     k_mutex_lock(&s_audio_mutex, K_FOREVER);
