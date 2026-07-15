@@ -21,7 +21,7 @@
 #include <interfaces/audio.h>
 #include <interfaces/radio.h>
 
-#define BRIDGE_SAMPLE_RATE (16000) // Sample rate for direct analogue paths
+#define BRIDGE_SAMPLE_RATE (48000U) // Patched DSP's native ADC/DAC rate
 
 #define C62_M17_INPUT_RATE (24000U)
 #define C62_ADC_NATIVE_RATE (48000U)
