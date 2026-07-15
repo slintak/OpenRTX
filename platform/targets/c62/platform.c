@@ -15,7 +15,10 @@
 #include <zephyr/drivers/uart.h>
 #include <zephyr/kernel.h>
 #include <interfaces/audio.h>
+#include "core/audio_path.h"
+#include "core/audio_stream.h"
 #include <math.h>
+#include <string.h>
 
 // Reference the GPIO nodes
 static const struct gpio_dt_spec speaker_enable =
@@ -66,6 +69,83 @@ struct adc_sequence sequence = {
 };
 
 static int battery_init(void);
+
+#define C62_BOOT_TONE_RATE 48000U
+#define C62_BOOT_TONE_BLOCK 960U
+#define C62_BOOT_TONE_BUFFER (2U * C62_BOOT_TONE_BLOCK)
+#define C62_BOOT_TONE_BLOCK_MS 20U
+#define C62_BOOT_TONE_LEAD_IN 5U
+#define C62_BOOT_TONE_DURATION 10U
+#define C62_BOOT_TONE_LEAD_OUT 5U
+
+static void fill_boot_tone(stream_sample_t *buffer, const bool enabled)
+{
+    for (size_t i = 0; i < C62_BOOT_TONE_BLOCK; i++) {
+        if (enabled) {
+            const float phase = 2.0f * 3.14159265f * (float)(i % 48U) / 48.0f;
+            buffer[i] = (stream_sample_t)roundf(12000.0f * sinf(phase));
+        } else {
+            buffer[i] = 0;
+        }
+    }
+}
+
+static bool write_boot_tone_block(const streamId stream, const bool enabled)
+{
+    stream_sample_t *idle = outputStream_getIdleBuffer(stream);
+    if (idle == NULL)
+        return false;
+
+    fill_boot_tone(idle, enabled);
+
+    /* AudioTrack may queue a block faster than the DSP consumes it. */
+    const int64_t started = k_uptime_get();
+    if (outputStream_sync(stream, true) == false)
+        return false;
+
+    const int64_t elapsed = k_uptime_get() - started;
+    if (elapsed < C62_BOOT_TONE_BLOCK_MS)
+        k_sleep(K_MSEC(C62_BOOT_TONE_BLOCK_MS - elapsed));
+
+    return true;
+}
+
+static void speaker_boot_beep(void)
+{
+    static stream_sample_t buffer[C62_BOOT_TONE_BUFFER];
+    memset(buffer, 0, sizeof(buffer));
+
+    pathId path = audioPath_request(SOURCE_MCU, SINK_SPK, PRIO_PROMPT);
+    if ((path < 0) || (audioPath_getStatus(path) != PATH_OPEN)) {
+        printk("C62 48-kHz boot beep: audio path unavailable\n");
+        return;
+    }
+
+    streamId stream = audioStream_start(path, buffer, ARRAY_SIZE(buffer),
+                                        C62_BOOT_TONE_RATE,
+                                        STREAM_OUTPUT | BUF_CIRC_DOUBLE);
+    if (stream < 0) {
+        printk("C62 48-kHz boot beep: stream error %d\n", (int)stream);
+        audioPath_release(path);
+        return;
+    }
+
+    bool ok = true;
+    for (size_t block = 0; (block < C62_BOOT_TONE_LEAD_IN) && ok; block++)
+        ok = write_boot_tone_block(stream, false);
+    for (size_t block = 0; (block < C62_BOOT_TONE_DURATION) && ok; block++)
+        ok = write_boot_tone_block(stream, true);
+    for (size_t block = 0; (block < C62_BOOT_TONE_LEAD_OUT) && ok; block++)
+        ok = write_boot_tone_block(stream, false);
+
+    if (ok)
+        audioStream_stop(stream);
+    else
+        audioStream_terminate(stream);
+    audioPath_release(path);
+
+    printk("C62 48-kHz boot beep: %s\n", ok ? "complete" : "write failed");
+}
 
 /**
  * Set display brightness using PWM on pin A02
@@ -149,6 +229,9 @@ void platform_init_csk6()
 
     /* Initialise audio */
     audio_init();
+
+    /* Demonstrate a complete MCU -> 48-kHz DSP -> speaker audio path. */
+    speaker_boot_beep();
 
     /* Init ADC for Battery reading */
     battery_init();
