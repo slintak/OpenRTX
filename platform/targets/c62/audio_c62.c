@@ -140,11 +140,15 @@ static const int16_t c62_decim_coeffs[C62_DECIM_TAPS] = {
 typedef struct {
     AudioRecord record;
     struct streamCtx *ctx;
+    stream_sample_t *interleaved_buffer;
     stream_sample_t *raw_buffer;
     stream_sample_t *ready_buffer;
     size_t block_samples;
     size_t raw_samples;
     uint32_t physical_rate;
+    uint32_t record_channel_mask;
+    uint8_t record_channels;
+    uint8_t channel_index;
     uint8_t next_half;
     uint8_t instance;
     bool opened;
@@ -253,6 +257,8 @@ static void c62_input_close(C62InputStream *stream)
 
     if (stream->opened)
         AudioRecord_dtor(&stream->record);
+    if (stream->interleaved_buffer != NULL)
+        k_free(stream->interleaved_buffer);
     if (stream->raw_buffer != NULL)
         k_free(stream->raw_buffer);
 
@@ -289,6 +295,35 @@ static int c62_input_start(const uint8_t instance, const void *config,
     stream->raw_samples = stream->decimate_by_two ? stream->block_samples * 2 :
                                                     stream->block_samples;
 
+    const uint32_t requested_channel = (uint32_t)(uintptr_t)config;
+    stream->record_channel_mask = requested_channel;
+    stream->record_channels = 1;
+
+    /*
+     * The patched DSP keeps its six-channel input producer. AudioRecord's
+     * stereo mask selects producer indices 0 (MIC) and 1 (RX), returning only
+     * those two channels interleaved. Expose the requested one as mono to the
+     * OpenRTX stream interface.
+     */
+    if ((stream->physical_rate == C62_ADC_NATIVE_RATE)
+        && ((requested_channel == C62_AUDIO_CHANNEL_MIC)
+            || (requested_channel == C62_AUDIO_CHANNEL_RX))) {
+        stream->record_channel_mask = C62_AUDIO_CHANNEL_MIC
+                                    | C62_AUDIO_CHANNEL_RX;
+        stream->record_channels = 2;
+        stream->channel_index = (requested_channel == C62_AUDIO_CHANNEL_RX) ?
+                                    1 :
+                                    0;
+
+        stream->interleaved_buffer = k_malloc(stream->raw_samples
+                                              * stream->record_channels
+                                              * sizeof(stream_sample_t));
+        if (stream->interleaved_buffer == NULL) {
+            c62_input_close(stream);
+            return -ENOMEM;
+        }
+    }
+
     if (stream->decimate_by_two) {
         stream->raw_buffer =
             k_malloc(stream->raw_samples * sizeof(stream_sample_t));
@@ -298,9 +333,9 @@ static int c62_input_start(const uint8_t instance, const void *config,
         }
     }
 
-    uint32_t channel = (uint32_t)(uintptr_t)config;
     int ret = AudioRecord_ctor(&stream->record, 0, stream->physical_rate,
-                               PCM_16_BIT, channel, 0, NULL);
+                               PCM_16_BIT, stream->record_channel_mask, 0,
+                               NULL);
     if (ret != 0) {
         printk("C62AUDIO input open failed: endpoint=%u logical=%u physical=%u "
                "error=%d\n",
@@ -325,9 +360,11 @@ static int c62_input_start(const uint8_t instance, const void *config,
     stream->rate_start_ms = k_uptime_get();
     stream->rate_report_ms = stream->rate_start_ms;
 
-    printk("C62AUDIO input start: endpoint=%u logical=%u physical=%u block=%u "
-           "DSPframe=%u conversion=%s\n",
-           instance, ctx->sampleRate, stream->physical_rate,
+    printk("C62AUDIO input start: endpoint=%u channel=0x%x record=0x%x "
+           "channels=%u logical=%u physical=%u block=%u DSPframe=%u "
+           "conversion=%s\n",
+           instance, requested_channel, stream->record_channel_mask,
+           stream->record_channels, ctx->sampleRate, stream->physical_rate,
            (uint32_t)stream->block_samples, (uint32_t)af_frame_samples,
            stream->decimate_by_two ? "FIR/2" : "none");
     return 0;
@@ -357,9 +394,14 @@ static int c62_input_sync(struct streamCtx *ctx, uint8_t dirty)
     if (ctx->bufMode == BUF_CIRC_DOUBLE)
         destination += stream->next_half * stream->block_samples;
 
-    void *read_buffer = stream->decimate_by_two ? (void *)stream->raw_buffer :
-                                                  (void *)destination;
-    size_t read_bytes = stream->raw_samples * sizeof(stream_sample_t);
+    stream_sample_t *mono_buffer = stream->decimate_by_two ?
+                                       stream->raw_buffer :
+                                       destination;
+    void *read_buffer = (stream->interleaved_buffer != NULL) ?
+                            (void *)stream->interleaved_buffer :
+                            (void *)mono_buffer;
+    size_t read_bytes = stream->raw_samples * stream->record_channels
+                      * sizeof(stream_sample_t);
     ssize_t ret = AudioRecord_read(&stream->record, read_buffer, read_bytes);
     if (ret < 0)
         return (int)ret;
@@ -367,6 +409,14 @@ static int c62_input_sync(struct streamCtx *ctx, uint8_t dirty)
         printk("C62AUDIO short input read: expected=%u actual=%d\n",
                (uint32_t)read_bytes, (int)ret);
         return -EIO;
+    }
+
+    if (stream->interleaved_buffer != NULL) {
+        for (size_t i = 0; i < stream->raw_samples; i++) {
+            mono_buffer[i] =
+                stream->interleaved_buffer[i * stream->record_channels
+                                           + stream->channel_index];
+        }
     }
 
     if (stream->decimate_by_two)
